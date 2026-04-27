@@ -194,6 +194,13 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# ChatList локальная БД (по умолчанию рядом с приложением)
+chatlist.sqlite
+chatlist.sqlite-journal
+chatlist.log
+chatlist.log.1
+chatlist.log.2
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
