@@ -117,13 +117,59 @@ def post_openai_compatible_chat(
         "model": model_name,
         "messages": [{"role": "user", "content": p}],
     }
+    return _post_chat_body(u, key, body)
+
+
+def post_openai_compatible_chat_messages(
+    api_url: str,
+    env_var: str,
+    messages: list[dict[str, str]],
+    api_model: str,
+) -> Tuple[bool, str, Optional[str]]:
+    """
+    POST в стиле OpenAI Chat Completions с произвольным списком messages.
+    Применяется для системных инструкций (например AI-ассистент промтов).
+    """
+    u = _ensure_chat_completions_path(_validate_url(api_url))
+    model_name = (api_model or "").strip()
+    if not model_name:
+        return False, "В настройке модели не задано поле «модель API» (api_model).", "Не задана модель API"
+    if not messages:
+        raise ValueError("Список messages пуст")
+    normalized_messages: list[dict[str, str]] = []
+    for m in messages:
+        role = str((m or {}).get("role", "")).strip()
+        content = str((m or {}).get("content", "")).strip()
+        if role not in {"system", "user", "assistant"} or not content:
+            raise ValueError("Некорректный messages: нужны role(system/user/assistant) и непустой content")
+        normalized_messages.append({"role": role, "content": content})
+
+    try:
+        key = resolve_api_key(env_var)
+    except (KeyError, ValueError) as e:
+        msg = str(e)
+        logger.warning("Ключ API: %s", msg)
+        return False, msg, msg
+
+    body: dict[str, Any] = {
+        "model": model_name,
+        "messages": normalized_messages,
+    }
+    return _post_chat_body(u, key, body)
+
+
+def _post_chat_body(
+    api_url: str,
+    api_key: str,
+    body: dict[str, Any],
+) -> Tuple[bool, str, Optional[str]]:
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {key}",
+        "Authorization": f"Bearer {api_key}",
     }
     try:
         with httpx.Client(timeout=_DEFAULT_TIMEOUT, follow_redirects=True) as client:
-            r = client.post(u, headers=headers, json=body)
+            r = client.post(api_url, headers=headers, json=body)
     except httpx.RequestError as e:
         err = f"Сетевая ошибка: {e}"
         logger.exception("RequestError: %s", e)

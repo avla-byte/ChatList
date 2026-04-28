@@ -18,7 +18,7 @@ import models
 from session_state import ResultRow, ResultSession
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal, QSize
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -33,11 +33,13 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPushButton,
     QPlainTextEdit,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -67,6 +69,26 @@ def _setup_file_log() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _apply_app_icon(app: QApplication, window: QMainWindow) -> None:
+    """
+    Устанавливает иконку приложения и окна из app.ico, если файл существует.
+    """
+    icon_path = Path(__file__).resolve().parent / "app.ico"
+    try:
+        if not icon_path.is_file():
+            logger.warning("Файл иконки не найден: %s", icon_path)
+            return
+        icon = QIcon(str(icon_path))
+        if icon.isNull():
+            logger.warning("Не удалось загрузить иконку: %s", icon_path)
+            return
+        app.setWindowIcon(icon)
+        window.setWindowIcon(icon)
+        logger.info("Иконка приложения применена: %s", icon_path)
+    except Exception:
+        logger.exception("Ошибка применения иконки приложения")
+
+
 _dotenv = Path(__file__).resolve().parent / ".env"
 if _dotenv.is_file():
     dotenv.load_dotenv(_dotenv)
@@ -78,6 +100,9 @@ logging.basicConfig(
 logger.info("load_dotenv: %s (exists=%s)", _dotenv, _dotenv.is_file())
 
 DEFAULT_DB_KEY = "db_path"
+ASSISTANT_MODEL_KEY = "assistant_model_id"
+UI_THEME_KEY = "ui_theme"
+UI_FONT_SIZE_KEY = "ui_font_size"
 
 
 def default_db_path() -> Path:
@@ -121,6 +146,38 @@ class _FetchThread(QThread):
             self.done.emit(rows)
         except Exception as e:
             logger.exception("FetchThread")
+            self.failed.emit(str(e))
+        finally:
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+
+class _ImprovePromptThread(QThread):
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, db_path: Path, user_prompt: str, assistant_model_id: Optional[int]) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._user_prompt = user_prompt
+        self._assistant_model_id = assistant_model_id
+
+    def run(self) -> None:
+        c: sqlite3.Connection | None = None
+        try:
+            c = db.get_connection(self._db_path)
+            db.init_db(c)
+            result = models.improve_prompt(
+                c,
+                self._user_prompt,
+                assistant_model_id=self._assistant_model_id,
+            )
+            self.done.emit(result)
+        except Exception as e:
+            logger.exception("ImprovePromptThread")
             self.failed.emit(str(e))
         finally:
             if c is not None:
@@ -531,6 +588,75 @@ class _SavedResultsDialog(QDialog):
         d2.exec()
 
 
+class _PromptAssistDialog(QDialog):
+    def __init__(self, parent: QWidget, result: models.PromptAssistResult) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Улучшение промта")
+        self.setMinimumSize(QSize(760, 500))
+        self.selected_prompt: Optional[str] = None
+        self._options: list[tuple[str, str]] = []
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Исходный промт:"))
+        self._original = QPlainTextEdit()
+        self._original.setReadOnly(True)
+        self._original.setMaximumHeight(90)
+        self._original.setPlainText(result.original_prompt)
+        lay.addWidget(self._original)
+
+        self._options.append(("Улучшенный (рекомендуется)", result.improved_prompt))
+        for i, alt in enumerate(result.alternatives, start=1):
+            self._options.append((f"Альтернатива {i}", alt))
+        for key in ("code", "analysis", "creative"):
+            val = result.adaptations.get(key, "")
+            if not val:
+                continue
+            title = {
+                "code": "Адаптация: Код",
+                "analysis": "Адаптация: Анализ",
+                "creative": "Адаптация: Креатив",
+            }.get(key, key)
+            self._options.append((title, val))
+
+        row_pick = QHBoxLayout()
+        row_pick.addWidget(QLabel("Вариант:"), 0)
+        self._cb_variant = QComboBox()
+        for title, _ in self._options:
+            self._cb_variant.addItem(title)
+        row_pick.addWidget(self._cb_variant, 1)
+        lay.addLayout(row_pick)
+
+        lay.addWidget(QLabel("Предпросмотр выбранного варианта:"))
+        self._preview = QPlainTextEdit()
+        self._preview.setReadOnly(True)
+        self._preview.setPlainText(self._options[0][1] if self._options else "")
+        lay.addWidget(self._preview, 1)
+        self._cb_variant.currentIndexChanged.connect(self._on_variant_changed)
+
+        actions = QDialogButtonBox()
+        b_apply = actions.addButton("Подставить выбранный", QDialogButtonBox.ButtonRole.AcceptRole)
+        b_close = actions.addButton("Закрыть", QDialogButtonBox.ButtonRole.RejectRole)
+        b_apply.clicked.connect(self._apply_current)
+        b_close.clicked.connect(self.reject)
+        lay.addWidget(actions)
+
+    def _select_and_accept(self, text: str) -> None:
+        self.selected_prompt = text
+        self.accept()
+
+    def _on_variant_changed(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self._options):
+            self._preview.setPlainText("")
+            return
+        self._preview.setPlainText(self._options[idx][1])
+
+    def _apply_current(self) -> None:
+        idx = self._cb_variant.currentIndex()
+        if idx < 0 or idx >= len(self._options):
+            return
+        self._select_and_accept(self._options[idx][1])
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -542,7 +668,11 @@ class MainWindow(QMainWindow):
         self._session = ResultSession()
         self._order_model_ids: list[int] = []
         self._fetch: Optional[_FetchThread] = None
+        self._improve: Optional[_ImprovePromptThread] = None
         self._source_prompt_id: Optional[int] = None
+        self._assistant_model_id: Optional[int] = self._load_assistant_model_id()
+        self._ui_theme: str = "light"
+        self._ui_font_size: int = 10
         w = QWidget(self)
         self.setCentralWidget(w)
         v = QVBoxLayout(w)
@@ -560,21 +690,37 @@ class MainWindow(QMainWindow):
         v.addWidget(self._ed_prompt, 1)
         row_btn = QHBoxLayout()
         self._btn_send = QPushButton("Отправить")
-        self._btn_save = QPushButton("Сохранить выбранные ответы")
-        self._btn_lib = QPushButton("Сохранить промт в библиотеку")
-        self._btn_saved_db = QPushButton("Сохранённые ответы…")
-        self._btn_prompts = QPushButton("Промты…")
-        self._btn_models = QPushButton("Нейросети…")
+        self._btn_improve = QPushButton("Улучшить промт")
+        self._btn_assistant_model = QPushButton("Модель ассистента…")
+        self._btn_settings = QPushButton("Настройки")
+        self._btn_about = QPushButton("О программе")
+        self._btn_save_menu = QToolButton()
+        self._btn_save_menu.setText("Сохранить")
+        self._btn_save_menu.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._btn_save_menu.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._save_menu = QMenu(self)
+        self._act_save_results = self._save_menu.addAction("Сохранить выбранные ответы")
+        self._act_save_prompt = self._save_menu.addAction("Сохранить промт в библиотеку")
+        self._save_menu.addSeparator()
+        self._act_export_md = self._save_menu.addAction("Экспорт в Markdown…")
+        self._act_export_json = self._save_menu.addAction("Экспорт в JSON…")
+        self._btn_save_menu.setMenu(self._save_menu)
+        self._btn_refs_menu = QToolButton()
+        self._btn_refs_menu.setText("Справочники")
+        self._btn_refs_menu.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._btn_refs_menu.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._refs_menu = QMenu(self)
+        self._act_open_saved = self._refs_menu.addAction("Сохранённые ответы…")
+        self._act_open_prompts = self._refs_menu.addAction("Промты…")
+        self._act_open_models = self._refs_menu.addAction("Нейросети…")
+        self._btn_refs_menu.setMenu(self._refs_menu)
         row_btn.addWidget(self._btn_send)
-        row_btn.addWidget(self._btn_save)
-        row_btn.addWidget(self._btn_lib)
-        row_btn.addWidget(self._btn_saved_db)
-        row_btn.addWidget(self._btn_prompts)
-        self._btn_exp_md = QPushButton("В Markdown…")
-        self._btn_exp_json = QPushButton("В JSON…")
-        row_btn.addWidget(self._btn_exp_md)
-        row_btn.addWidget(self._btn_exp_json)
-        row_btn.addWidget(self._btn_models)
+        row_btn.addWidget(self._btn_improve)
+        row_btn.addWidget(self._btn_assistant_model)
+        row_btn.addWidget(self._btn_settings)
+        row_btn.addWidget(self._btn_about)
+        row_btn.addWidget(self._btn_save_menu)
+        row_btn.addWidget(self._btn_refs_menu)
         row_btn.addStretch()
         v.addLayout(row_btn)
         v.addWidget(QLabel("Результаты (временно, в памяти до сохранения):"))
@@ -605,23 +751,120 @@ class MainWindow(QMainWindow):
         self._table.itemDoubleClicked.connect(self._on_result_double_click)
         self._cb_prompts.currentIndexChanged.connect(self._on_prompt_pick)
         self._btn_send.clicked.connect(self._on_send)
-        self._btn_save.clicked.connect(self._on_save_results)
-        self._btn_lib.clicked.connect(self._on_save_prompt)
-        self._btn_saved_db.clicked.connect(self._on_open_saved_results)
-        self._btn_prompts.clicked.connect(self._on_open_prompts)
-        self._btn_models.clicked.connect(self._on_open_models)
+        self._btn_improve.clicked.connect(self._on_improve_prompt)
+        self._btn_assistant_model.clicked.connect(self._on_choose_assistant_model)
+        self._btn_settings.clicked.connect(self._on_open_settings)
+        self._btn_about.clicked.connect(self._on_about)
+        self._act_save_results.triggered.connect(self._on_save_results)
+        self._act_save_prompt.triggered.connect(self._on_save_prompt)
+        self._act_open_saved.triggered.connect(self._on_open_saved_results)
+        self._act_open_prompts.triggered.connect(self._on_open_prompts)
+        self._act_open_models.triggered.connect(self._on_open_models)
         self._ed_filter.textChanged.connect(self._apply_result_filter)
         self._cb_sort.currentIndexChanged.connect(self._apply_result_sort)
-        self._btn_exp_md.clicked.connect(self._on_export_md)
-        self._btn_exp_json.clicked.connect(self._on_export_json)
+        self._act_export_md.triggered.connect(self._on_export_md)
+        self._act_export_json.triggered.connect(self._on_export_json)
         self._refresh_prompts_combo()
         self._rebuild_table()
+        self._load_ui_settings()
+        self._apply_ui_settings()
+        self._show_assistant_model_status()
+
+    def _load_ui_settings(self) -> None:
+        try:
+            saved_theme = (db.get_setting(self._conn, UI_THEME_KEY) or "light").strip().lower()
+            self._ui_theme = saved_theme if saved_theme in {"light", "dark"} else "light"
+            raw_font = (db.get_setting(self._conn, UI_FONT_SIZE_KEY) or "").strip()
+            if raw_font:
+                parsed = int(raw_font)
+                self._ui_font_size = parsed if 8 <= parsed <= 24 else 10
+        except Exception:
+            logger.exception("load ui settings")
+            self._ui_theme = "light"
+            self._ui_font_size = 10
+
+    def _apply_ui_settings(self) -> None:
+        try:
+            app = QApplication.instance()
+            if app is None:
+                logger.warning("QApplication.instance() is None, настройки UI не применены")
+                return
+
+            f = app.font()
+            f.setPointSize(self._ui_font_size)
+            app.setFont(f)
+
+            if self._ui_theme == "dark":
+                app.setStyleSheet(
+                    """
+                    QWidget { background-color: #1e1e1e; color: #f0f0f0; }
+                    QPlainTextEdit, QLineEdit, QComboBox, QTableWidget {
+                        background-color: #2b2b2b; color: #f0f0f0;
+                        border: 1px solid #555;
+                    }
+                    QPushButton, QToolButton {
+                        background-color: #3a3a3a; color: #f0f0f0;
+                        border: 1px solid #666; padding: 4px 8px;
+                    }
+                    QPushButton:hover, QToolButton:hover { background-color: #4a4a4a; }
+                    QHeaderView::section { background-color: #2f2f2f; color: #f0f0f0; }
+                    QMenu { background-color: #2b2b2b; color: #f0f0f0; border: 1px solid #555; }
+                    QStatusBar { background-color: #1e1e1e; color: #d8d8d8; }
+                    """
+                )
+            else:
+                app.setStyleSheet("")
+
+            logger.info("Настройки UI применены: theme=%s, font_size=%s", self._ui_theme, self._ui_font_size)
+        except Exception:
+            logger.exception("apply ui settings")
+
+    def _save_ui_settings(self, theme: str, font_size: int) -> None:
+        theme_n = (theme or "").strip().lower()
+        if theme_n not in {"light", "dark"}:
+            raise ValueError("Тема должна быть light или dark")
+        if font_size < 8 or font_size > 24:
+            raise ValueError("Размер шрифта должен быть в диапазоне 8..24")
+        db.set_setting(self._conn, UI_THEME_KEY, theme_n)
+        db.set_setting(self._conn, UI_FONT_SIZE_KEY, str(font_size))
+        self._ui_theme = theme_n
+        self._ui_font_size = font_size
+
+    def _load_assistant_model_id(self) -> Optional[int]:
+        raw = db.get_setting(self._conn, ASSISTANT_MODEL_KEY)
+        if not raw:
+            return None
+        try:
+            v = int(raw)
+            return v if v > 0 else None
+        except ValueError:
+            logger.warning("Некорректное значение settings[%s]=%r", ASSISTANT_MODEL_KEY, raw)
+            return None
+
+    def _save_assistant_model_id(self, model_id: int) -> None:
+        if model_id < 1:
+            raise ValueError("Некорректный id модели ассистента")
+        db.set_setting(self._conn, ASSISTANT_MODEL_KEY, str(model_id))
+        self._assistant_model_id = model_id
+
+    def _show_assistant_model_status(self) -> None:
+        label = "авто (первая активная)"
+        if self._assistant_model_id:
+            m = db.get_model(self._conn, self._assistant_model_id)
+            if m and m.is_active == 1:
+                label = f"{m.name} (id={m.id})"
+            else:
+                label = "настройка устарела, используем авто"
+        self._status.showMessage(f"AI-ассистент: {label}", 5000)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         # Дожидаемся воркера, чтобы не закрыть БД в середине запроса
         if self._fetch and self._fetch.isRunning():
             self._status.showMessage("Ожидание завершения запроса…", 0)
             self._fetch.wait(60_000)
+        if self._improve and self._improve.isRunning():
+            self._status.showMessage("Ожидание завершения улучшения промта…", 0)
+            self._improve.wait(60_000)
         try:
             self._conn.close()
         except Exception:
@@ -839,6 +1082,162 @@ class MainWindow(QMainWindow):
         th.finished.connect(self._on_fetch_thread_finished)
         th.start()
 
+    def _on_improve_prompt(self) -> None:
+        t = self._ed_prompt.toPlainText().strip()
+        if not t:
+            QMessageBox.information(self, "Улучшение промта", "Введите непустой текст промта.")
+            return
+        if self._improve and self._improve.isRunning():
+            return
+        self._btn_improve.setEnabled(False)
+        self._status.showMessage("Улучшаем промт…")
+        th = _ImprovePromptThread(self._db_path, t, self._assistant_model_id)
+        self._improve = th
+        th.done.connect(self._on_improve_done)
+        th.failed.connect(self._on_improve_failed)
+        th.finished.connect(self._on_improve_finished)
+        th.start()
+
+    def _on_improve_done(self, result: object) -> None:
+        if not isinstance(result, models.PromptAssistResult):
+            QMessageBox.warning(self, "Улучшение промта", "Неожиданный формат результата.")
+            return
+        d = _PromptAssistDialog(self, result)
+        if d.exec() == QDialog.DialogCode.Accepted and (d.selected_prompt or "").strip():
+            self._ed_prompt.setPlainText((d.selected_prompt or "").strip())
+            self._source_prompt_id = None
+            self._cb_prompts.setCurrentIndex(0)
+            self._status.showMessage("Выбранный вариант подставлен в поле ввода", 8000)
+            return
+        self._status.showMessage("Варианты улучшения получены", 6000)
+
+    def _on_improve_failed(self, msg: str) -> None:
+        QMessageBox.warning(self, "Улучшение промта", msg or "Не удалось улучшить промт.")
+        self._status.showMessage("Не удалось улучшить промт", 8000)
+
+    def _on_improve_finished(self) -> None:
+        self._btn_improve.setEnabled(True)
+        self._improve = None
+
+    def _on_choose_assistant_model(self) -> None:
+        try:
+            active_models = db.list_models(self._conn, active_only=True)
+        except Exception as e:
+            logger.exception("list_models for assistant choose")
+            QMessageBox.critical(self, "Модель ассистента", str(e))
+            return
+        if not active_models:
+            QMessageBox.information(
+                self,
+                "Модель ассистента",
+                "Нет активных моделей. Сначала добавьте/активируйте модель.",
+            )
+            return
+        d = QDialog(self)
+        d.setWindowTitle("Выбор модели ассистента")
+        d.setMinimumSize(QSize(480, 140))
+        lay = QVBoxLayout(d)
+        lay.addWidget(QLabel("Выберите модель, которая будет использоваться кнопкой «Улучшить промт»:"))
+        cb = QComboBox()
+        selected_index = 0
+        for i, m in enumerate(active_models):
+            cb.addItem(f"{m.name} · {m.api_model}", m.id)
+            if self._assistant_model_id and m.id == self._assistant_model_id:
+                selected_index = i
+        cb.setCurrentIndex(selected_index)
+        lay.addWidget(cb)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(d.accept)
+        bb.rejected.connect(d.reject)
+        save_btn = bb.button(QDialogButtonBox.StandardButton.Save)
+        if save_btn:
+            save_btn.setText("Сохранить")
+        cancel_btn = bb.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_btn:
+            cancel_btn.setText("Отмена")
+        lay.addWidget(bb)
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        picked = cb.currentData()
+        if not isinstance(picked, int):
+            QMessageBox.warning(self, "Модель ассистента", "Не удалось определить выбранную модель.")
+            return
+        try:
+            self._save_assistant_model_id(picked)
+        except Exception as e:
+            logger.exception("save assistant model id")
+            QMessageBox.critical(self, "Модель ассистента", str(e))
+            return
+        m = db.get_model(self._conn, picked)
+        name = m.name if m else f"id={picked}"
+        self._status.showMessage(f"Модель ассистента сохранена: {name}", 8000)
+
+    def _on_open_settings(self) -> None:
+        d = QDialog(self)
+        d.setWindowTitle("Настройки")
+        d.setMinimumSize(QSize(420, 200))
+        lay = QVBoxLayout(d)
+
+        form = QFormLayout()
+        cb_theme = QComboBox()
+        cb_theme.addItem("Светлая", "light")
+        cb_theme.addItem("Тёмная", "dark")
+        cb_theme.setCurrentIndex(1 if self._ui_theme == "dark" else 0)
+        form.addRow("Тема:", cb_theme)
+
+        ed_font = QLineEdit(str(self._ui_font_size))
+        ed_font.setPlaceholderText("8..24")
+        form.addRow("Размер шрифта панелей:", ed_font)
+        lay.addLayout(form)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
+        )
+        save_btn = bb.button(QDialogButtonBox.StandardButton.Save)
+        if save_btn:
+            save_btn.setText("Сохранить")
+        cancel_btn = bb.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_btn:
+            cancel_btn.setText("Отмена")
+        bb.rejected.connect(d.reject)
+        lay.addWidget(bb)
+
+        def on_save() -> None:
+            try:
+                theme = str(cb_theme.currentData() or "light")
+                font_raw = (ed_font.text() or "").strip()
+                if not font_raw:
+                    raise ValueError("Введите размер шрифта (8..24)")
+                font_size = int(font_raw)
+                self._save_ui_settings(theme, font_size)
+                self._apply_ui_settings()
+                self._status.showMessage("Настройки сохранены", 5000)
+                d.accept()
+            except ValueError as e:
+                QMessageBox.warning(d, "Настройки", str(e))
+            except Exception as e:
+                logger.exception("save ui settings")
+                QMessageBox.critical(d, "Настройки", f"Не удалось сохранить настройки: {e}")
+
+        bb.accepted.connect(on_save)
+        d.exec()
+
+    def _on_about(self) -> None:
+        text = (
+            "ChatList\n\n"
+            "Программа для отправки одного промта в несколько моделей "
+            "и сравнения ответов в едином окне.\n\n"
+            "Основные возможности:\n"
+            "• библиотека промтов;\n"
+            "• список нейросетей и массовая отправка;\n"
+            "• сохранение выбранных ответов в SQLite;\n"
+            "• экспорт в Markdown/JSON;\n"
+            "• AI-ассистент для улучшения промтов."
+        )
+        QMessageBox.about(self, "О программе", text)
+
     def _on_fetch_thread_finished(self) -> None:
         self._btn_send.setEnabled(True)
         if self._fetch and self._fetch is not None:
@@ -930,6 +1329,7 @@ class MainWindow(QMainWindow):
         d.exec()
         if self._fetch and self._fetch.isRunning():
             return
+        self._show_assistant_model_status()
         self._status.showMessage("Список моделей обновлён", 3000)
 
 
@@ -938,6 +1338,7 @@ def main() -> int:
         _setup_file_log()
         app = QApplication(sys.argv)
         w = MainWindow()
+        _apply_app_icon(app, w)
         w.show()
         return int(app.exec())
     except Exception:
